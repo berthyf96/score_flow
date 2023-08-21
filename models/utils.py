@@ -22,21 +22,21 @@ import functools
 import jax.numpy as jnp
 
 import datasets
-import sde_lib
+import score_flow.sde_lib as sde_lib
 import jax
 import numpy as np
 from flax.training import checkpoints
-from utils import batch_mul
+from score_flow.utils import batch_mul
 
 
 # The dataclass that stores all training states
 @flax.struct.dataclass
 class State:
   step: int
-  optimizer: flax.optim.Optimizer
-  lr: float
+  opt_state: Any
   model_state: Any
   ema_rate: float
+  params: Any
   params_ema: Any
   rng: Any
 
@@ -44,7 +44,7 @@ class State:
 @flax.struct.dataclass
 class DeqState:
   step: int
-  optimizer: flax.optim.Optimizer
+  optimizer: Any
   lr: float
   ema_rate: float
   params_ema: Any

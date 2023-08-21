@@ -15,7 +15,6 @@
 
 # pylint: skip-file
 """Utility code for generating and saving image grids and checkpointing.
-
    The `save_image` code is copied from
    https://github.com/google/flax/blob/master/examples/vae/utils.py,
    which is a JAX equivalent to the same function in TorchVision
@@ -51,9 +50,7 @@ def load_training_state(filepath, state):
 
 def save_image(ndarray, fp, nrow=8, padding=2, pad_value=0.0, format=None):
   """Make a grid of images and save it into an image file.
-
   Pixel values are assumed to be within [0, 1].
-
   Args:
     ndarray (array_like): 4D mini-batch images of shape (B x H x W x C).
     fp: A filename(string) or file object.

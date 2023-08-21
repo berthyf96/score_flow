@@ -98,7 +98,6 @@ def get_score_t(score_fn):
 def get_sde_loss_fn(sde, model, train, reduce_mean=True, continuous=True, likelihood_weighting=True,
                     importance_weighting=True, eps=1e-5):
   """Create a loss function for training with arbirary SDEs.
-
   Args:
     sde: An `sde_lib.SDE` object that represents the forward SDE.
     model: A `flax.linen.Module` object that represents the architecture of the score-based model.
@@ -110,7 +109,6 @@ def get_sde_loss_fn(sde, model, train, reduce_mean=True, continuous=True, likeli
       according to https://arxiv.org/abs/2101.09258; otherwise use the weighting recommended in our paper.
     importance_weighting: If `True`, use importance weighting to reduce the variance of likelihood weighting.
     eps: A `float` number. The smallest time step to sample from.
-
   Returns:
     A loss function.
   """
@@ -118,13 +116,11 @@ def get_sde_loss_fn(sde, model, train, reduce_mean=True, continuous=True, likeli
 
   def loss_fn(rng, params, states, batch):
     """Compute the loss function.
-
     Args:
       rng: A JAX random state.
       params: A dictionary that contains trainable parameters of the score-based model.
       states: A dictionary that contains mutable states of the score-based model.
       batch: A mini-batch of training data.
-
     Returns:
       loss: A scalar that represents the average loss value across the mini-batch.
       new_model_state: A dictionary that contains the mutated states of the score-based model.
@@ -168,7 +164,6 @@ def get_sde_loss_fn(sde, model, train, reduce_mean=True, continuous=True, likeli
 def get_step_fn(sde, model, train, optimize_fn=None, reduce_mean=False, continuous=True, likelihood_weighting=False,
                 importance_weighting=False, smallest_time=1e-5):
   """Create a one-step training/evaluation function.
-
   Args:
     sde: An `sde_lib.SDE` object that represents the forward SDE.
     model: A `flax.linen.Module` object that represents the architecture of the score-based model.
@@ -178,7 +173,6 @@ def get_step_fn(sde, model, train, optimize_fn=None, reduce_mean=False, continuo
     continuous: `True` indicates that the model is defined to take continuous time steps.
     likelihood_weighting: If `True`, weight the mixture of score matching losses according to
       https://arxiv.org/abs/2101.09258; otherwise use the weighting recommended by our paper.
-
   Returns:
     A one-step function for training or evaluation.
   """
@@ -198,14 +192,11 @@ def get_step_fn(sde, model, train, optimize_fn=None, reduce_mean=False, continuo
 
   def step_fn(carry_state, batch):
     """Running one step of training or evaluation.
-
     This function will undergo `jax.lax.scan` so that multiple steps can be pmapped and jit-compiled together
     for faster execution.
-
     Args:
       carry_state: A tuple (JAX random state, `flax.struct.dataclass` containing the training state).
       batch: A mini-batch of training/evaluation data.
-
     Returns:
       new_carry_state: The updated tuple of `carry_state`.
       loss: The average loss value of this state.
@@ -335,14 +326,11 @@ def get_dequantizer_step_fn(sde, score_fn, deq_model, scaler, inverse_scaler,
 
   def step_fn(carry_state, batch):
     """Running one step of training or evaluation.
-
     This function will undergo `jax.lax.scan` so that multiple steps can be pmapped and jit-compiled together
     for faster execution.
-
     Args:
       carry_state: A tuple (JAX random state, `flax.struct.dataclass` containing the training state).
       batch: A mini-batch of training/evaluation data.
-
     Returns:
       new_carry_state: The updated tuple of `carry_state`.
       loss: The average loss value of this state.

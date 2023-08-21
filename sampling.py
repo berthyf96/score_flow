@@ -24,12 +24,12 @@ import jax.random as random
 import abc
 import flax
 
-from models.utils import from_flattened_numpy, to_flattened_numpy, get_score_fn
+from score_flow.models.utils import from_flattened_numpy, to_flattened_numpy, get_score_fn
 from scipy import integrate
-import sde_lib
-from utils import batch_mul, batch_add
+from score_flow import sde_lib
+from score_flow.utils import batch_mul, batch_add
 
-from models import utils as mutils
+from score_flow.models import utils as mutils
 
 _CORRECTORS = {}
 _PREDICTORS = {}

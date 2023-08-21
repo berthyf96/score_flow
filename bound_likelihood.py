@@ -21,10 +21,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-import utils
-from utils import batch_mul
-from models import utils as mutils
-from utils import get_div_fn, get_value_div_fn
+import score_flow.utils as utils
+from score_flow.utils import batch_mul
+from score_flow.models import utils as mutils
+from score_flow.utils import get_div_fn, get_value_div_fn
 
 
 def get_likelihood_bound_fn(sde, model, inverse_scaler, hutchinson_type='Rademacher',
@@ -187,13 +187,16 @@ def get_likelihood_offset_fn(sde, score_fn, eps=1e-5):
 
     alpha, beta = sde.marginal_prob(jnp.ones_like(data), eps_vec)
     q_mean = noisy_data / alpha + batch_mul(beta ** 2, score / alpha)
-    q_std = beta / jnp.mean(alpha, axis=(1, 2, 3))
+    # q_std = beta / jnp.mean(alpha, axis=(1, 2, 3))
+    q_std = beta / jnp.mean(alpha)
 
     n_dim = np.prod(data.shape[1:])
     p_entropy = n_dim / 2. * (np.log(2 * np.pi) + 2 * jnp.log(p_std) + 1.)
+    # q_recon = n_dim / 2. * (np.log(2 * np.pi) + 2 * jnp.log(q_std)) + batch_mul(0.5 / (q_std ** 2),
+    #                                                                             jnp.square(data - q_mean).sum(
+    #                                                                               axis=(1, 2, 3)))
     q_recon = n_dim / 2. * (np.log(2 * np.pi) + 2 * jnp.log(q_std)) + batch_mul(0.5 / (q_std ** 2),
-                                                                                jnp.square(data - q_mean).sum(
-                                                                                  axis=(1, 2, 3)))
+                                                                                jnp.square(data - q_mean).reshape(data.shape[0], -1).sum(axis=-1))
     offset = q_recon - p_entropy
     return offset
 
