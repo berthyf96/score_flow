@@ -27,7 +27,7 @@ import flax
 from score_flow.models.utils import from_flattened_numpy, to_flattened_numpy, get_score_fn
 from scipy import integrate
 from score_flow import sde_lib
-from score_flow.utils import batch_mul, batch_add
+from score_flow.utils import batch_mul
 
 from score_flow.models import utils as mutils
 

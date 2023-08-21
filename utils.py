@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2020 The Google Research Authors.
+# Copyright 2022 The Google Research Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,25 +13,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# pylint: skip-file
-"""Utility code for generating and saving image grids and checkpointing.
-   The `save_image` code is copied from
-   https://github.com/google/flax/blob/master/examples/vae/utils.py,
-   which is a JAX equivalent to the same function in TorchVision
-   (https://github.com/pytorch/vision/blob/master/torchvision/utils.py)
-"""
-
+"""Utils for score_prior."""
 import math
-from typing import Any, Dict, Optional, TypeVar
+import os
 
-import flax
 import jax
 import jax.numpy as jnp
+import matplotlib.pyplot as plt
+from matplotlib.colors import Normalize
+from mpl_toolkits.axes_grid1 import ImageGrid
+import numpy as np
+import pandas as pd
 from PIL import Image
+import scipy
 import tensorflow as tf
-from jax import numpy as jnp
+from tensorflow.python.summary.summary_iterator import summary_iterator
 
-T = TypeVar("T")
+from score_flow import sde_lib
 
 
 def batch_add(a, b):
@@ -42,97 +40,254 @@ def batch_mul(a, b):
   return jax.vmap(lambda a, b: a * b)(a, b)
 
 
-def load_training_state(filepath, state):
-  with tf.io.gfile.GFile(filepath, "rb") as f:
-    state = flax.serialization.from_bytes(state, f.read())
-  return state
+def plot_image_grid(y, nrow=None, padding=0.1, title='', cmap='gray', normalize=(0, 1), figsize=(10, 10)):
+  """Plot an image grid with matplotlib.
+  
+  Source: https://github.com/ameroyer/glow_jax/blob/main/train.ipynb.
+  """
+  images = np.clip(y, 0., 1.) if y.shape[-1] == 3 else y
+  fig = plt.figure(figsize=figsize)
+  fig.suptitle(title, fontsize=20)
+  if nrow is None:
+    nrow = int(np.floor(np.sqrt(images.shape[0])))
+  ncol = len(y) // nrow
+  grid = ImageGrid(fig, 111, nrows_ncols=(nrow, ncol), axes_pad=padding)
+  for ax in grid: 
+    ax.set_axis_off()
+  for ax, im in zip(grid, images):
+    ax.imshow(im, cmap=cmap, norm=Normalize(*normalize))
+  fig.subplots_adjust(top=0.98)
+  plt.show()
+  return fig
+
+def get_sde(config
+            ):
+  """Return the SDE and time-0 epsilon based on the given config."""
+  if config.training.sde.lower() == 'vpsde':
+    sde = sde_lib.VPSDE(
+        beta_min=config.model.beta_min, beta_max=config.model.beta_max,
+        N=config.model.num_scales)
+    t0_eps = 1e-3  # epsilon for stability near time 0
+  elif config.training.sde.lower() == 'subvpsde':
+    sde = sde_lib.subVPSDE(
+        beta_min=config.model.beta_min, beta_max=config.model.beta_max,
+        N=config.model.num_scales)
+    t0_eps = 1e-3
+  elif config.training.sde.lower() == 'vesde':
+    sde = sde_lib.VESDE(
+        sigma_min=config.model.sigma_min, sigma_max=config.model.sigma_max,
+        N=config.model.num_scales)
+    t0_eps = 1e-5
+  else:
+    raise NotImplementedError(f'SDE {config.training.sde} unknown.')
+  t0_eps = config.training.smallest_time
+  return sde, t0_eps
 
 
-def save_image(ndarray, fp, nrow=8, padding=2, pad_value=0.0, format=None):
+def get_marginal_dist_fn(config
+                         ):
+  """Return a function that gives the scale and std. dev. of $p_0t$.
+  See https://github.com/yang-song/score_sde/blob/main/sde_lib.py.
+  `alpha_t` and `beta_t` are determined by the method
+  `score_sde.sde_lib.SDE.marginal_prob`, where `alpha_t` is the coefficient of
+  the mean, and `beta_t` is the std. dev.
+  Args:
+    config: An ml_collections.ConfigDict with the SDE configuration.
+  Returns:
+    _marginal_dist_fn: A callable that returns the mean coefficient `alpha_t`
+      and std. dev. `beta_t` for a given diffusion time `t`.
+  """
+  if config.training.sde.lower() == 'vpsde':
+    beta_0, beta_1 = config.model.beta_min, config.model.beta_max
+    def _marginal_dist_fn(t):
+      log_mean_coeff = -0.25 * t ** 2 * (beta_1 - beta_0) - 0.5 * t * beta_0
+      alpha_t = jnp.exp(log_mean_coeff)
+      beta_t = jnp.sqrt(1 - jnp.exp(2. * log_mean_coeff))
+      return alpha_t, beta_t
+
+  elif config.training.sde.lower() == 'vesde':
+    sigma_min, sigma_max = config.model.sigma_min, config.model.sigma_max
+    def _marginal_dist_fn(t):
+      alpha_t = jnp.ones_like(t)
+      beta_t = sigma_min * (sigma_max / sigma_min) ** t
+      return alpha_t, beta_t
+
+  elif config.training.sde.lower() == 'subvpsde':
+    beta_0, beta_1 = config.model.beta_min, config.model.beta_max
+    def _marginal_dist_fn(t):
+      log_mean_coeff = -0.25 * t ** 2 * (beta_1 - beta_0) - 0.5 * t * beta_0
+      alpha_t = jnp.exp(log_mean_coeff)
+      beta_t = 1 - jnp.exp(2. * log_mean_coeff)
+      return alpha_t, beta_t
+  else:
+    raise NotImplementedError(f'Unsupported SDE: {config.training.sde}')
+
+  return _marginal_dist_fn
+
+
+def psplit(
+    rng
+):
+  """Split a JAX RNG into pmapped RNGs."""
+  rng, *step_rngs = jax.random.split(rng, jax.local_device_count() + 1)
+  step_rngs = jnp.asarray(step_rngs)
+  return rng, step_rngs
+
+
+def gaussian_logp(x, mu, sigma):
+  """Evaluates the log-probability of x under N(mu, sigma**2)."""
+  dim = x.size
+  return (-dim / 2. * jnp.log(2 * jnp.pi * sigma**2) - jnp.sum((x - mu)**2) /
+          (2 * sigma**2))
+
+
+def save_image_grid(ndarray,
+                    fp,
+                    nrow = 8,
+                    padding = 2,
+                    image_format = None):
   """Make a grid of images and save it into an image file.
+  This implementation is modified from the one in
+  https://github.com/yang-song/score_sde/blob/main/utils.py.
   Pixel values are assumed to be within [0, 1].
   Args:
-    ndarray (array_like): 4D mini-batch images of shape (B x H x W x C).
+    ndarray: 4D mini-batch images of shape (B x H x W x C).
     fp: A filename(string) or file object.
-    nrow (int, optional): Number of images displayed in each row of the grid.
-      The final grid size is ``(B / nrow, nrow)``. Default: ``8``.
-    padding (int, optional): amount of padding. Default: ``2``.
-    pad_value (float, optional): Value for the padded pixels. Default: ``0``.
-    format(Optional):  If omitted, the format to use is determined from the
+    nrow: Number of images displayed in each row of the grid.
+      The final grid size is ``(nrow, B // nrow)``.
+    padding: Amount of zero-padding on each image.
+    image_format:  If omitted, the format to use is determined from the
       filename extension. If a file object was used instead of a filename, this
       parameter should always be used.
   """
-  if not (isinstance(ndarray, jnp.ndarray) or
+  if not (isinstance(ndarray, (jnp.ndarray, np.ndarray)) or
           (isinstance(ndarray, list) and
-           all(isinstance(t, jnp.ndarray) for t in ndarray))):
-    raise TypeError("array_like of tensors expected, got {}".format(
-      type(ndarray)))
+           all(isinstance(t, (jnp.ndarray, np.ndarray)) for t in ndarray))):
+    raise TypeError('array_like of tensors expected, got {}'.format(
+        type(ndarray)))
+  ndarray = np.asarray(ndarray)
 
-  ndarray = jnp.asarray(ndarray)
+  # Keep largest-possible number of images for given `nrow`.
+  ncol = len(ndarray) // nrow
+  ndarray = ndarray[:nrow * ncol]
 
-  if ndarray.ndim == 4 and ndarray.shape[-1] == 1:  # single-channel images
-    ndarray = jnp.concatenate((ndarray, ndarray, ndarray), -1)
+  def _pad(image):
+    # Pads a 3D array in the height and width dimensions.
+    return np.pad(image, ((padding, padding), (padding, padding), (0, 0)))
 
-  # make the mini-batch of images into a grid
-  nmaps = ndarray.shape[0]
-  xmaps = min(nrow, nmaps)
-  ymaps = int(math.ceil(float(nmaps) / xmaps))
-  height, width = int(ndarray.shape[1] + padding), int(ndarray.shape[2] +
-                                                       padding)
-  num_channels = ndarray.shape[3]
-  grid = jnp.full(
-    (height * ymaps + padding, width * xmaps + padding, num_channels),
-    pad_value).astype(jnp.float32)
-  k = 0
-  for y in range(ymaps):
-    for x in range(xmaps):
-      if k >= nmaps:
-        break
-      grid = jax.ops.index_update(
-        grid, jax.ops.index[y * height + padding:(y + 1) * height,
-              x * width + padding:(x + 1) * width], ndarray[k])
-      k = k + 1
+  grid = np.concatenate([
+      np.concatenate([
+          _pad(im) for im in ndarray[row * ncol:(row + 1) * ncol]], axis=1)
+      for row in range(nrow)], axis=0)
 
-  # Add 0.5 after unnormalizing to [0, 255] to round to nearest integer
-  ndarr = jnp.clip(grid * 255.0 + 0.5, 0, 255).astype(jnp.uint8)
-  im = Image.fromarray(ndarr.copy())
-  im.save(fp, format=format)
+  # For grayscale images, need to remove the third axis.
+  grid = np.squeeze(grid)
+
+  # Add 0.5 after unnormalizing to [0, 255] to round to nearest integer.
+  ndarr = np.clip(grid * 255. + 0.5, 0, 255).astype(np.uint8)
+
+  im = Image.fromarray(ndarr)
+  im.save(fp, format=image_format)
 
 
-def flatten_dict(config):
-  """Flatten a hierarchical dict to a simple dict."""
-  new_dict = {}
-  for key, value in config.items():
-    if isinstance(value, dict):
-      sub_dict = flatten_dict(value)
-      for subkey, subvalue in sub_dict.items():
-        new_dict[key + "/" + subkey] = subvalue
-    elif isinstance(value, tuple):
-      new_dict[key] = str(value)
-    else:
-      new_dict[key] = value
-  return new_dict
+def is_coordinator():
+  return jax.process_index() == 0
 
 
-def get_div_fn(fn):
-  """Create the divergence function of `fn` using the Hutchinson-Skilling trace estimator."""
+def convert_tb_data(root_dir, sort_by=None):
+  """Convert local TensorBoard data into Pandas DataFrame.
 
-  def div_fn(x, t, eps):
-    grad_fn = lambda data: jnp.sum(fn(data, t) * eps)
-    grad_fn_eps = jax.grad(grad_fn)(x)
-    return jnp.sum(grad_fn_eps * eps, axis=tuple(range(1, len(x.shape))))
+  Function takes the root directory path and recursively parses
+  all events data.    
+  If the `sort_by` value is provided then it will use that column
+  to sort values; typically `wall_time` or `step`.
 
-  return div_fn
+  *Note* that the whole data is converted into a DataFrame.
+  Depending on the data size this might take a while. If it takes
+  too long then narrow it to some sub-directories.
+
+  Paramters:
+      root_dir: (str) path to root dir with tensorboard data.
+      sort_by: (optional str) column name to sort by.
+
+  Returns:
+      pandas.DataFrame with [wall_time, name, step, value] columns.
+
+  """
+  def convert_tfevent(filepath):
+    return pd.DataFrame([
+        parse_tfevent(e) for e in summary_iterator(filepath) if len(e.summary.value)
+    ])
+
+  def parse_tfevent(tfevent):
+    return dict(
+        wall_time=tfevent.wall_time,
+        name=tfevent.summary.value[0].tag,
+        step=tfevent.step,
+        value=tf.make_ndarray(tfevent.summary.value[0].tensor).item(),
+    )
+
+  columns_order = ['wall_time', 'name', 'step', 'value']
+
+  out = []
+  for (root, _, filenames) in os.walk(root_dir):
+    for filename in filenames:
+      if "events.out.tfevents" not in filename:
+        continue
+      file_full_path = os.path.join(root, filename)
+      out.append(convert_tfevent(file_full_path))
+
+  # Concatenate (and sort) all partial individual dataframes
+  all_df = pd.concat(out)[columns_order]
+  if sort_by is not None:
+    all_df = all_df.sort_values(sort_by)
+
+  return all_df.reset_index(drop=True)
 
 
-def get_value_div_fn(fn):
-  """Return both the function value and its estimated divergence via Hutchinson's trace estimator."""
+def smooth(scalars, weight):
+  """
+  EMA implementation according to
+  https://github.com/tensorflow/tensorboard/blob/34877f15153e1a2087316b9952c931807a122aa7/tensorboard/components/vz_line_chart2/line-chart.ts#L699
+  """
+  last = 0
+  smoothed = []
+  num_acc = 0
+  for next_val in scalars:
+    last = last * weight + (1 - weight) * next_val
+    num_acc += 1
+    # de-bias
+    debias_weight = 1
+    if weight != 1:
+        debias_weight = 1 - math.pow(weight, num_acc)
+    smoothed_val = last / debias_weight
+    smoothed.append(smoothed_val)
+  return np.array(smoothed)
 
-  def value_div_fn(x, t, eps):
-    def value_grad_fn(data):
-      f = fn(data, t)
-      return jnp.sum(f * eps), f
-    grad_fn_eps, value = jax.grad(value_grad_fn, has_aux=True)(x)
-    return value, jnp.sum(grad_fn_eps * eps, axis=tuple(range(1, len(x.shape))))
 
-  return value_div_fn
+def is_converged(values, smoothing_kernel_width,
+                 decrease_thresh=-1e-6, increase_thresh=1e-3, patience=3,
+                 min_num_values=100):
+  """Check convergence of the given list of loss values.
+  
+  Args:
+    values: List or array of loss values.
+    smoothing_kernel_width: Width of kernel for Gaussian filtering of loss curve.
+    decrease_thresh: If last `patience` number of steps all showed a relative
+      decrease less than `decrease_thresh`, then consider `values` converged.
+    increase_thresh: If last `patience` number of steps all showed a relative
+      increase greater than `increase_thresh`, then consider `values` converged.
+    patience: Do not consider converged until the last `patience` number of
+      steps all meet the convergence criterion.
+    min_num_values: Only consider convergence once at least `min_num_values`
+      are given.
+  """
+  if len(values) < min_num_values:
+    return False
+  smoothed = scipy.ndimage.gaussian_filter(values, smoothing_kernel_width)
+  rel_diffs = (smoothed[1:] - smoothed[:-1]) / abs(smoothed[:-1])
+  if np.all(rel_diffs[-patience:] > increase_thresh):
+    return True
+  if np.all(rel_diffs[-patience:] < 0) and np.all(abs(rel_diffs[-patience:]) < decrease_thresh):
+    return True
+  return False

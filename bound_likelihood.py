@@ -21,9 +21,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from score_flow.models import utils as mutils
 import score_flow.utils as utils
 from score_flow.utils import batch_mul
-from score_flow.models import utils as mutils
 from score_flow.utils import get_div_fn, get_value_div_fn
 
 

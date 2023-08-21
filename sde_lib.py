@@ -186,10 +186,6 @@ class VPSDE(SDE):
     return 0.5 * (-2 * jnp.log(term1) + 2 * jnp.log(term2)
                   + self.beta_0 * (-2 * eps + eps ** 2 - (t - 2) * t)
                   + self.beta_1 * (-eps ** 2 + t ** 2))
-    # lmbda = 10.
-    # def _cdf(s):
-    #   return 1 - jnp.exp(-lmbda * s)
-    # return _cdf(t) - _cdf(eps)
 
   def sample_importance_weighted_time_for_likelihood(self, rng, shape, quantile=None, eps=1e-5, steps=100):
     Z = self.likelihood_importance_cum_weight(self.T, eps=eps)
@@ -270,10 +266,6 @@ class subVPSDE(SDE):
     term2 = jnp.where(exponent2 <= 1e-3, jnp.log(exponent2), jnp.log(jnp.exp(exponent2) - 1.))
     return 0.5 * (-4 * term1 + 4 * term2
                   + (2 * eps - eps ** 2 + t * (t - 2)) * self.beta_0 + (eps ** 2 - t ** 2) * self.beta_1)
-    # lmbda = 10.
-    # def _cdf(s):
-    #   return 1 - jnp.exp(-lmbda * s)
-    # return _cdf(t) - _cdf(eps)
 
   def sample_importance_weighted_time_for_likelihood(self, rng, shape, quantile=None, eps=1e-5, steps=100):
     Z = self.likelihood_importance_cum_weight(self.T, eps=eps)

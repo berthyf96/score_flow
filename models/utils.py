@@ -19,13 +19,10 @@ from typing import Any
 
 import flax
 import functools
-import jax.numpy as jnp
-
-import datasets
-import score_flow.sde_lib as sde_lib
 import jax
+import jax.numpy as jnp
 import numpy as np
-from flax.training import checkpoints
+from score_flow import sde_lib
 from score_flow.utils import batch_mul
 
 

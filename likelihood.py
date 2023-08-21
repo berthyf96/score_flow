@@ -22,8 +22,8 @@ import flax
 import jax.numpy as jnp
 import numpy as np
 from scipy import integrate
-from models import utils as mutils
-from utils import get_div_fn, get_value_div_fn, batch_mul
+from score_flow.models import utils as mutils
+from score_flow.utils import get_div_fn, get_value_div_fn, batch_mul
 
 
 def get_likelihood_fn(sde, model, inverse_scaler, hutchinson_type='Rademacher', rtol=1e-5, atol=1e-5, method='RK45',

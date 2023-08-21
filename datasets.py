@@ -15,9 +15,17 @@
 
 # pylint: skip-file
 """Return training and evaluation/test datasets from config files."""
+from typing import Any, Optional, Tuple
+import os
+
 import jax
+import ml_collections
+import numpy as np
+from scipy.ndimage import gaussian_filter
 import tensorflow as tf
 import tensorflow_datasets as tfds
+
+SUPPORTED_DATASETS = ['CIFAR10', 'CELEBA', 'fastMRI', 'SVHN', 'LSUN', 'CelebAHQ', 'SgrA', 'GRMHD', 'Pynoisy']
 
 
 def get_data_scaler(config):
@@ -68,100 +76,177 @@ def central_crop(image, size):
   return tf.image.crop_to_bounding_box(image, top, left, size, size)
 
 
-def get_dataset(config, additional_dim=None, uniform_dequantization=False, evaluation=False):
-  """Create data loaders for training and evaluation.
-
-  Args:
-    config: A ml_collection.ConfigDict parsed from config files.
-    additional_dim: An integer or `None`. If present, add one additional dimension to the output data,
-      which equals the number of steps jitted together.
-    uniform_dequantization: If `True`, add uniform dequantization to images.
-    evaluation: If `True`, fix number of epochs to 1.
-
-  Returns:
-    train_ds, eval_ds, dataset_builder.
-  """
-  # Compute batch size for this worker.
-  batch_size = config.training.batch_size if not evaluation else config.eval.batch_size
-  if batch_size % jax.device_count() != 0:
-    raise ValueError(f'Batch sizes ({batch_size} must be divided by'
-                     f'the number of devices ({jax.device_count()})')
-
-  per_device_batch_size = batch_size // jax.device_count()
-  # Reduce this when image resolution is too large and data pointer is stored
-  shuffle_buffer_size = 10000
-  prefetch_size = tf.data.experimental.AUTOTUNE
-  num_epochs = None if not evaluation else 1
-  # Create additional data dimension when jitting multiple steps together
-  if additional_dim is None:
-    batch_dims = [jax.local_device_count(), per_device_batch_size]
-  else:
-    batch_dims = [jax.local_device_count(), additional_dim, per_device_batch_size]
-
-  # Create dataset builders for each dataset.
+def get_dataset_builder_and_resize_op(config: ml_collections.ConfigDict) -> Tuple[Any, Any]:
+  """Create dataset builder and image resizing function for dataset."""
+  data_dir = config.data.tfds_dir
   if config.data.dataset == 'CIFAR10':
-    dataset_builder = tfds.builder('cifar10')
-    train_split_name = 'train'
-    eval_split_name = 'test'
+    dataset_builder = tfds.builder('cifar10', data_dir=data_dir)
 
     def resize_op(img):
       img = tf.image.convert_image_dtype(img, tf.float32)
-      return tf.image.resize(img, [config.data.image_size, config.data.image_size], antialias=True)
-
-  elif config.data.dataset == 'MNIST':
-    dataset_builder = tfds.builder('mnist')
-    train_split_name = 'train'
-    eval_split_name = 'test'
-
-    def resize_op(img):
-      img = tf.image.convert_image_dtype(img, tf.float32)
-      return tf.image.resize(img, [config.data.image_size, config.data.image_size], antialias=True)
-
-  elif config.data.dataset == 'SVHN':
-    dataset_builder = tfds.builder('svhn_cropped')
-    train_split_name = 'train'
-    eval_split_name = 'test'
-
-    def resize_op(img):
-      img = tf.image.convert_image_dtype(img, tf.float32)
-      return tf.image.resize(img, [config.data.image_size, config.data.image_size], antialias=True)
-
+      if config.data.num_channels == 1:
+        img = tf.image.rgb_to_grayscale(img)
+      return tf.image.resize(
+          img, [config.data.image_size, config.data.image_size],
+          antialias=config.data.antialias)
 
   elif config.data.dataset == 'CELEBA':
-    dataset_builder = tfds.builder('celeb_a')
-    train_split_name = 'train'
-    eval_split_name = 'validation'
+    dataset_builder = tfds.builder('celeb_a', data_dir=data_dir)
 
     def resize_op(img):
       img = tf.image.convert_image_dtype(img, tf.float32)
       img = central_crop(img, 140)
-      img = resize_small(img, config.data.image_size)
-      return img
+      if config.data.num_channels == 1:
+        img = tf.image.rgb_to_grayscale(img)
+      return tf.image.resize(
+          img, [config.data.image_size, config.data.image_size],
+          antialias=config.data.antialias)
 
-  elif config.data.dataset == 'ImageNet':
-    size = {
-      32: '32x32',
-      64: '64x64'
-    }[config.data.image_size]
-    dataset_builder = tfds.builder(f'downsampled_imagenet/{size}')
-    train_split_name = 'train'
-    eval_split_name = 'validation'
+  elif config.data.dataset == 'fastMRI':
+    features_dict = {
+      'image': tf.io.FixedLenFeature([320*320], tf.float32),
+      'shape': tf.io.FixedLenFeature([2], tf.int64)
+    }
+    def parse_example(serialized_example):
+      parsed_example = tf.io.parse_single_example(serialized_example, features=features_dict)
+      shape = parsed_example['shape']
+      parsed_example['image'] = tf.reshape(parsed_example['image'], (shape[0], shape[1], 1))
+      return parsed_example
+    
+    def ds_from_tfrecords(tfrecords_pattern):
+      shard_files = tf.io.matching_files(tfrecords_pattern)
+      shard_files = tf.random.shuffle(shard_files)
+      # shard_files = tf.random.shuffle(shard_files)
+      shards = tf.data.Dataset.from_tensor_slices(shard_files)
+      ds = shards.interleave(tf.data.TFRecordDataset)
+      ds = ds.map(
+        map_func=parse_example,
+        num_parallel_calls=tf.data.experimental.AUTOTUNE)
+      return ds
+
+    dataset_builder = {
+      'train': ds_from_tfrecords(os.path.join(config.data.tfds_dir, 'fastmri/fastmri-train.tfrecord-*')),
+      'val': ds_from_tfrecords(os.path.join(config.data.tfds_dir, 'fastmri/fastmri-val.tfrecord-*')),
+      'test': ds_from_tfrecords(os.path.join(config.data.tfds_dir, 'fastmri/fastmri-test.tfrecord-*')),
+    }
+
+    def resize_op(img):
+      if config.data.num_channels == 3:
+        img = tf.image.grayscale_to_rgb(img)
+      return tf.image.resize(
+          img, [config.data.image_size, config.data.image_size],
+          antialias=config.data.antialias)
+
+  elif config.data.dataset == 'SVHN':
+    dataset_builder = tfds.builder('svhn_cropped', data_dir=data_dir)
 
     def resize_op(img):
       img = tf.image.convert_image_dtype(img, tf.float32)
-      return img
+      if config.data.num_channels == 1:
+        img = tf.image.rgb_to_grayscale(img)
+      return tf.image.resize(
+        img, [config.data.image_size, config.data.image_size],
+        antialias=config.data.antialias)
 
+  elif config.data.dataset == 'LSUN':
+    dataset_builder = tfds.builder(f'lsun/{config.data.category}', data_dir=data_dir)
 
-  elif config.data.dataset in ('FFHQ', 'CelebAHQ', 'LSUN'):
-    dataset_builder = tf.data.TFRecordDataset(config.data.tfrecords_path)
-    train_split_name = eval_split_name = 'train'
+    if config.data.image_size == 128:
+      def resize_op(img):
+        img = tf.image.convert_image_dtype(img, tf.float32)
+        img = resize_small(img, config.data.image_size)
+        img = central_crop(img, config.data.image_size)
+        if config.data.num_channels == 1:
+          img = tf.image.rgb_to_grayscale(img)
+        return img
 
+    else:
+      def resize_op(img):
+        img = crop_resize(img, config.data.image_size)
+        img = tf.image.convert_image_dtype(img, tf.float32)
+        if config.data.num_channels == 1:
+          img = tf.image.rgb_to_grayscale(img)
+        return img
+
+  elif config.data.dataset == 'CelebAHQ':
+    def ds_from_tfrecords(tfrecords_pattern):
+      shard_files = tf.io.matching_files(tfrecords_pattern)
+      shard_files = tf.random.shuffle(shard_files)
+      shards = tf.data.Dataset.from_tensor_slices(shard_files)
+      ds = shards.interleave(tf.data.TFRecordDataset)
+      return ds
+  
+    dataset_builder = {
+      'train': tf.data.TFRecordDataset(os.path.join(config.data.tfds_dir, 'celebahq_256/celebahq_256_train-r08.tfrecords')),
+      'val': tf.data.TFRecordDataset(os.path.join(config.data.tfds_dir, 'celebahq_256/celebahq_256_test-r08.tfrecords')),
+      'test': tf.data.TFRecordDataset(os.path.join(config.data.tfds_dir, 'celebahq_256/celebahq_256_test-r08.tfrecords')),
+    }
+    def resize_op(img):
+      if config.data.num_channels == 1:
+        img = tf.image.rgb_to_grayscale(img)
+      return tf.image.resize(
+          img, [config.data.image_size, config.data.image_size],
+          antialias=config.data.antialias)
+  elif config.data.dataset in ['SgrA', 'GRMHD', 'Pynoisy']:
+    if config.data.dataset == 'SgrA':
+      image_dim = 100 * 100
+      dataset_name = 'sgra'
+    elif config.data.dataset == 'GRMHD':
+      image_dim = 160 * 160
+      dataset_name = 'grmhd'
+    elif config.data.dataset == 'Pynoisy':
+      image_dim = 160 * 160
+      dataset_name = 'pynoisy'
+    features_dict = {
+      'image': tf.io.FixedLenFeature([image_dim], tf.float32),
+      'shape': tf.io.FixedLenFeature([2], tf.int64)
+    }
+    def parse_example(serialized_example):
+      parsed_example = tf.io.parse_single_example(serialized_example, features=features_dict)
+      shape = parsed_example['shape']
+      parsed_example['image'] = tf.reshape(parsed_example['image'], (shape[0], shape[1], 1))
+      return parsed_example
+    
+    def ds_from_tfrecords(tfrecords_pattern):
+      shard_files = tf.io.matching_files(tfrecords_pattern)
+      shard_files = tf.random.shuffle(shard_files)
+      # shard_files = tf.random.shuffle(shard_files)
+      shards = tf.data.Dataset.from_tensor_slices(shard_files)
+      ds = shards.interleave(tf.data.TFRecordDataset)
+      ds = ds.map(
+        map_func=parse_example,
+        num_parallel_calls=tf.data.experimental.AUTOTUNE)
+      return ds
+
+    dataset_builder = {
+      'train': ds_from_tfrecords(os.path.join(config.data.tfds_dir, f'{dataset_name}/{dataset_name}-train.tfrecord-*')),
+      'val': ds_from_tfrecords(os.path.join(config.data.tfds_dir, f'{dataset_name}/{dataset_name}-val.tfrecord-*')),
+      'test': ds_from_tfrecords(os.path.join(config.data.tfds_dir, f'{dataset_name}/{dataset_name}-test.tfrecord-*')),
+    }
+
+    def resize_op(img):
+      if config.data.num_channels == 3:
+        img = tf.image.grayscale_to_rgb(img)
+      return tf.image.resize(
+          img, [config.data.image_size, config.data.image_size],
+          antialias=config.data.antialias)
   else:
-    raise NotImplementedError(
-      f'Dataset {config.data.dataset} not yet supported.')
+    raise ValueError(
+        f'Dataset {config.data.dataset} not supported.')
+  return dataset_builder, resize_op
 
-  # Customize preprocess functions for each dataset.
-  if config.data.dataset in ('FFHQ', 'CelebAHQ', 'LSUN'):
+
+def get_preprocess_fn(config: ml_collections.ConfigDict,
+                      resize_op: Any,
+                      uniform_dequantization: bool = False,
+                      evaluation: bool = False) -> Any:
+  """Create preprocessing function for dataset."""
+
+  # Get function for tapering images with a centered Gaussian blob.
+  taper_fn = get_taper_fn(config)
+
+  if config.data.dataset == 'CelebAHQ':
+    @tf.autograph.experimental.do_not_convert
     def preprocess_fn(d):
       sample = tf.io.parse_single_example(d, features={
         'shape': tf.io.FixedLenFeature([3], tf.int64),
@@ -175,39 +260,208 @@ def get_dataset(config, additional_dim=None, uniform_dequantization=False, evalu
       if uniform_dequantization:
         img = (tf.random.uniform(img.shape, dtype=tf.float32) + img * 255.) / 256.
       return dict(image=img, label=None)
-
+  elif config.data.dataset == 'SgrA':
+    # These datasets' images can be randomly rotated and zoomed in/out.
+    @tf.autograph.experimental.do_not_convert
+    def preprocess_fn(d):
+      img = resize_op(d['image'])
+      if config.data.random_flip and not evaluation:
+        img = tf.image.random_flip_left_right(img)
+        img = tf.keras.layers.RandomRotation(
+          factor=(-1., 1.), fill_mode='constant', fill_value=0.)(img)
+        img = tf.keras.layers.RandomZoom(
+          height_factor=0.2, fill_mode='constant', fill_value=0.)(img)
+      if uniform_dequantization:
+        img = (tf.random.uniform(img.shape, dtype=tf.float32) + img * 255.) / 256.
+      return dict(image=img, label=d.get('label', None))
   else:
+    @tf.autograph.experimental.do_not_convert
     def preprocess_fn(d):
       """Basic preprocessing function scales data to [0, 1) and randomly flips."""
       img = resize_op(d['image'])
       if config.data.random_flip and not evaluation:
         img = tf.image.random_flip_left_right(img)
+      if config.data.taper:
+        img = tf.numpy_function(taper_fn, [img], tf.float32)
       if uniform_dequantization:
-        # img = (tf.random.uniform(img.shape, dtype=tf.float32) + img * 255.) / 256.
-        img = (tf.random.uniform((config.data.image_size, config.data.image_size,
-                                  config.data.num_channels), dtype=tf.float32) + img * 255.) / 256.
-
+        img = (tf.random.uniform(img.shape, dtype=tf.float32) + img * 255.) / 256.
       return dict(image=img, label=d.get('label', None))
 
-  def create_dataset(dataset_builder, split):
+  return preprocess_fn
+
+
+def get_dataset(
+    config: ml_collections.ConfigDict,
+    additional_dim: Optional[int] = None,
+    uniform_dequantization: bool = False,
+    evaluation: bool = False,
+    shuffle_seed: Optional[int] = None,
+    device_batch: bool = True
+) -> Tuple[tf.data.Dataset, tf.data.Dataset, tf.data.Dataset]:
+  """Create data loaders for training, validation, and testing.
+  Most of the logic from `score_sde/datasets.py` is kept.
+  Args:
+    config: The config.
+    additional_dim: If not `None`, add an additional dimension
+      to the output data for jitted steps.
+    uniform_dequantization: If `True`, uniformly dequantize the images.
+      This is usually only used when evaluating log-likelihood [bits/dim]
+      of the data.
+    evaluation: If `True`, fix number of epochs to 1.
+    shuffle_seed: Optional seed for shuffling dataset.
+    device_batch: If `True`, divide batch size into device batch and
+      local batch.
+  Returns:
+    train_ds, val_ds, test_ds.
+  """
+  if config.data.dataset not in SUPPORTED_DATASETS:
+    raise NotImplementedError(
+        f'Dataset {config.data.dataset} not yet supported.')
+
+  # Compute batch size for this worker.
+  batch_size = (
+      config.training.batch_size if not evaluation else config.eval.batch_size)
+  if batch_size % jax.device_count() != 0:
+    raise ValueError(f'Batch sizes ({batch_size} must be divided by '
+                     f'the number of devices ({jax.device_count()})')
+
+  per_device_batch_size = batch_size // jax.device_count()
+  # Reduce this when image resolution is too large and data pointer is stored
+  shuffle_buffer_size = 10000
+  prefetch_size = tf.data.experimental.AUTOTUNE
+  num_epochs = None if not evaluation else 1
+  # Create additional data dimension when jitting multiple steps together
+  if not device_batch:
+    batch_dims = [batch_size]
+  elif additional_dim is None:
+    batch_dims = [jax.local_device_count(), per_device_batch_size]
+  else:
+    batch_dims = [
+        jax.local_device_count(), additional_dim, per_device_batch_size
+    ]
+
+  # Get dataset builder.
+  dataset_builder, resize_op = get_dataset_builder_and_resize_op(config)
+
+  # Get preprocessing function.
+  preprocess_fn = get_preprocess_fn(
+      config, resize_op, uniform_dequantization, evaluation)
+
+  def create_dataset(dataset_builder: Any,
+                     split: str,
+                     take_val_from_train: bool = False,
+                     train_split: float = 0.9):
+    # Some datasets only include train and test sets, in which case we take
+    # validation data from the training set.
+    if split == 'test':
+      take_val_from_train = False
+    source_split = 'train' if take_val_from_train else split
+
     dataset_options = tf.data.Options()
     dataset_options.experimental_optimization.map_parallelization = True
-    dataset_options.experimental_threading.private_threadpool_size = 48
-    dataset_options.experimental_threading.max_intra_op_parallelism = 1
-    read_config = tfds.ReadConfig(options=dataset_options)
+    dataset_options.threading.private_threadpool_size = 48
+    dataset_options.threading.max_intra_op_parallelism = 1
+    read_config = tfds.ReadConfig(
+        options=dataset_options, shuffle_seed=shuffle_seed)
     if isinstance(dataset_builder, tfds.core.DatasetBuilder):
       dataset_builder.download_and_prepare()
       ds = dataset_builder.as_dataset(
-        split=split, shuffle_files=True, read_config=read_config)
+          split=source_split, shuffle_files=True, read_config=read_config)
+    elif config.data.dataset in [
+        'Eigenfaces', 'fastMRI', 'CelebAHQ', 'SgrA', 'GRMHD', 'Pynoisy'
+    ]:
+      ds = dataset_builder[source_split].with_options(dataset_options)
     else:
       ds = dataset_builder.with_options(dataset_options)
+
+    if take_val_from_train:
+      train_size = int(train_split * len(ds))
+      # Take the first `train_split` pct. for training and the rest for val.
+      ds = ds.take(train_size) if split == 'train' else ds.skip(train_size)
+
     ds = ds.repeat(count=num_epochs)
-    ds = ds.shuffle(shuffle_buffer_size)
+    ds = ds.shuffle(shuffle_buffer_size, seed=shuffle_seed)
     ds = ds.map(preprocess_fn, num_parallel_calls=tf.data.experimental.AUTOTUNE)
     for batch_size in reversed(batch_dims):
       ds = ds.batch(batch_size, drop_remainder=True)
     return ds.prefetch(prefetch_size)
 
-  train_ds = create_dataset(dataset_builder, train_split_name)
-  eval_ds = create_dataset(dataset_builder, eval_split_name)
-  return train_ds, eval_ds, dataset_builder
+  # Set the correct split names.
+  if config.data.dataset == 'CIFAR10':
+    train_ds = create_dataset(
+        dataset_builder, 'train', take_val_from_train=True)  # 50,000 * 0.9
+    val_ds = create_dataset(
+        dataset_builder, 'validation', take_val_from_train=True)  # 50,000 * 0.1
+    test_ds = create_dataset(dataset_builder, 'test')  # 10,000
+  elif config.data.dataset == 'CELEBA':
+    train_ds = create_dataset(dataset_builder, 'train')  # 162,770
+    test_ds = create_dataset(dataset_builder, 'test')  # 19,962
+    val_ds = create_dataset(dataset_builder, 'validation')  # 19,867
+  elif config.data.dataset == 'fastMRI':
+    train_ds = create_dataset(dataset_builder, 'train')  # 30,199
+    test_ds = create_dataset(dataset_builder, 'test')  # 571
+    val_ds = create_dataset(dataset_builder, 'val')  # 5,579
+  elif config.data.dataset == 'SVHN':
+    train_ds = create_dataset(dataset_builder, 'train')  # 73,257
+    test_ds = create_dataset(dataset_builder, 'extra')  # 531,131
+    val_ds = create_dataset(dataset_builder, 'test')  # 26,032
+  elif config.data.dataset == 'LSUN':
+    train_ds = create_dataset(
+        dataset_builder, 'train', take_val_from_train=True)  # 50,000 * 0.9
+    val_ds = create_dataset(
+        dataset_builder, 'validation', take_val_from_train=True)  # 50,000 * 0.1
+    test_ds = create_dataset(dataset_builder, 'validation')  # 10,000
+  elif config.data.dataset == 'CelebAHQ':
+    # NOTE: This assumes a validation set is not used during training, so
+    # uses the full training set for training.
+    train_ds = create_dataset(
+        dataset_builder, 'train', take_val_from_train=False)  # 29,990
+    val_ds = create_dataset(
+        dataset_builder, 'val', take_val_from_train=False)  # N/A
+    test_ds = create_dataset(dataset_builder, 'test')  # 10
+  elif config.data.dataset == 'SgrA':
+    train_ds = create_dataset(dataset_builder, 'train')  # 9,070
+    test_ds = create_dataset(dataset_builder, 'test')  # 10
+    val_ds = create_dataset(dataset_builder, 'val')  # 10
+  elif config.data.dataset == 'GRMHD':
+    train_ds = create_dataset(dataset_builder, 'train')  # 2,884
+    test_ds = create_dataset(dataset_builder, 'test')  # 10
+    val_ds = create_dataset(dataset_builder, 'val')  # 10
+  elif config.data.dataset == 'Pynoisy':
+    train_ds = create_dataset(dataset_builder, 'train')  # 12,000
+    test_ds = create_dataset(dataset_builder, 'test')  # 100
+    val_ds = create_dataset(dataset_builder, 'val')  # 100
+  return train_ds, val_ds, test_ds
+
+
+def get_taper_fn(config):
+
+  def make_circle_image(frac_radius: float = 1.):
+    """Creates a circle image with the given fractional radius.
+    
+    Args:
+      frac_radius: Radius of circle, in terms of percentage of image radius
+        (where image radius is image_size / 2). I.e., frac_radius = 1 makes
+        the largest-possible circle.
+    """
+    x = np.linspace(-1, 1, config.data.image_size, dtype=np.float32)
+    y = np.linspace(-1, 1, config.data.image_size, dtype=np.float32)
+    x, y = np.meshgrid(x, y)
+    d = np.sqrt(x * x + y * y)
+    circle = np.zeros((config.data.image_size, config.data.image_size), dtype=np.float32)
+    circle[d <= frac_radius] = 1
+    return circle
+
+  circle = make_circle_image(config.data.taper_frac_radius)
+  # Apply Gaussian blur to hard circle.
+  circle = gaussian_filter(circle, config.data.taper_gaussian_blur_sigma, mode='constant', cval=0)
+  circle = circle / circle.max()
+  circle[circle < 1e-3] = 0
+  # Add channel axis.
+  circle = np.expand_dims(circle, axis=-1)
+
+  def taper_fn(image):
+    tapered_image = image * circle
+    return tapered_image
+
+  return taper_fn

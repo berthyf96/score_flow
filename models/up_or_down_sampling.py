@@ -20,7 +20,7 @@ Many functions are ported from https://github.com/NVlabs/stylegan2.
 """
 
 import flax.linen as nn
-from typing import Any, Tuple, Optional, Sequence
+from typing import Any, Tuple, Optional
 import jax
 import jax.nn as jnn
 import jax.numpy as jnp

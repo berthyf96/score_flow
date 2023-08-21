@@ -18,7 +18,6 @@ import flax.linen as nn
 import functools
 import jax.nn.initializers as init
 import jax.numpy as jnp
-import jax
 
 
 def get_normalization(config, conditional=False):
