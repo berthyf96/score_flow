@@ -3,9 +3,12 @@ import abc
 import jax.numpy as jnp
 import jax
 import numpy as np
-from score_flow.utils import batch_mul
 import tensorflow_probability.substrates.jax as tfp
 tfd = tfp.distributions
+
+
+def batch_mul(a, b):
+  return jax.vmap(lambda a, b: a * b)(a, b)
 
 
 class SDE(abc.ABC):
