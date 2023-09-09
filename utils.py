@@ -291,3 +291,34 @@ def is_converged(values, smoothing_kernel_width,
   if np.all(rel_diffs[-patience:] < 0) and np.all(abs(rel_diffs[-patience:]) < decrease_thresh):
     return True
   return False
+
+
+def precondition_covariance(cov, eps=1e-3):
+  eigvals, eigvecs = np.linalg.eigh(cov)
+  eigvals += eps
+  cov = eigvecs @ np.diag(eigvals) @ eigvecs.T
+  return cov
+
+
+def get_div_fn(fn):
+  """Create the divergence function of `fn` using the Hutchinson-Skilling trace estimator."""
+
+  def div_fn(x, t, eps):
+    grad_fn = lambda data: jnp.sum(fn(data, t) * eps)
+    grad_fn_eps = jax.grad(grad_fn)(x)
+    return jnp.sum(grad_fn_eps * eps, axis=tuple(range(1, len(x.shape))))
+
+  return div_fn
+
+
+def get_value_div_fn(fn):
+  """Return both the function value and its estimated divergence via Hutchinson's trace estimator."""
+
+  def value_div_fn(x, t, eps):
+    def value_grad_fn(data):
+      f = fn(data, t)
+      return jnp.sum(f * eps), f
+    grad_fn_eps, value = jax.grad(value_grad_fn, has_aux=True)(x)
+    return value, jnp.sum(grad_fn_eps * eps, axis=tuple(range(1, len(x.shape))))
+
+  return value_div_fn

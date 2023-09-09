@@ -76,7 +76,7 @@ def central_crop(image, size):
   return tf.image.crop_to_bounding_box(image, top, left, size, size)
 
 
-def get_dataset_builder_and_resize_op(config: ml_collections.ConfigDict) -> Tuple[Any, Any]:
+def get_dataset_builder_and_resize_op(config: ml_collections.ConfigDict, shuffle_seed = None) -> Tuple[Any, Any]:
   """Create dataset builder and image resizing function for dataset."""
   data_dir = config.data.tfds_dir
   if config.data.dataset == 'CIFAR10':
@@ -115,8 +115,8 @@ def get_dataset_builder_and_resize_op(config: ml_collections.ConfigDict) -> Tupl
     
     def ds_from_tfrecords(tfrecords_pattern):
       shard_files = tf.io.matching_files(tfrecords_pattern)
-      shard_files = tf.random.shuffle(shard_files)
       # shard_files = tf.random.shuffle(shard_files)
+      shard_files = tf.random.shuffle(shard_files, seed=shuffle_seed)
       shards = tf.data.Dataset.from_tensor_slices(shard_files)
       ds = shards.interleave(tf.data.TFRecordDataset)
       ds = ds.map(
@@ -171,7 +171,7 @@ def get_dataset_builder_and_resize_op(config: ml_collections.ConfigDict) -> Tupl
   elif config.data.dataset == 'CelebAHQ':
     def ds_from_tfrecords(tfrecords_pattern):
       shard_files = tf.io.matching_files(tfrecords_pattern)
-      shard_files = tf.random.shuffle(shard_files)
+      shard_files = tf.random.shuffle(shard_files, seed=shuffle_seed)
       shards = tf.data.Dataset.from_tensor_slices(shard_files)
       ds = shards.interleave(tf.data.TFRecordDataset)
       return ds
@@ -192,7 +192,8 @@ def get_dataset_builder_and_resize_op(config: ml_collections.ConfigDict) -> Tupl
       image_dim = 100 * 100
       dataset_name = 'sgra'
     elif config.data.dataset == 'GRMHD':
-      image_dim = 160 * 160
+      # image_dim = 160 * 160
+      image_dim = 400 * 400
       dataset_name = 'grmhd'
     elif config.data.dataset == 'Pynoisy':
       image_dim = 160 * 160
@@ -209,8 +210,7 @@ def get_dataset_builder_and_resize_op(config: ml_collections.ConfigDict) -> Tupl
     
     def ds_from_tfrecords(tfrecords_pattern):
       shard_files = tf.io.matching_files(tfrecords_pattern)
-      shard_files = tf.random.shuffle(shard_files)
-      # shard_files = tf.random.shuffle(shard_files)
+      shard_files = tf.random.shuffle(shard_files, seed=shuffle_seed)
       shards = tf.data.Dataset.from_tensor_slices(shard_files)
       ds = shards.interleave(tf.data.TFRecordDataset)
       ds = ds.map(
@@ -260,17 +260,33 @@ def get_preprocess_fn(config: ml_collections.ConfigDict,
       if uniform_dequantization:
         img = (tf.random.uniform(img.shape, dtype=tf.float32) + img * 255.) / 256.
       return dict(image=img, label=None)
-  elif config.data.dataset == 'SgrA':
+  elif config.data.dataset == 'SgrA' or config.data.dataset == 'GRMHD':
     # These datasets' images can be randomly rotated and zoomed in/out.
     @tf.autograph.experimental.do_not_convert
     def preprocess_fn(d):
       img = resize_op(d['image'])
       if config.data.random_flip and not evaluation:
         img = tf.image.random_flip_left_right(img)
+      if config.data.random_rotation and not evaluation:
         img = tf.keras.layers.RandomRotation(
           factor=(-1., 1.), fill_mode='constant', fill_value=0.)(img)
+      if config.data.random_zoom and not evaluation:
+        print('USING RANDOM ZOOM')
+        # Assume that GRMHD and SgrA/RIAF images have ring diameter 40 uas and
+        # FOV 128 uas. We want ring diameters between 35 and 48 uas.
         img = tf.keras.layers.RandomZoom(
-          height_factor=0.2, fill_mode='constant', fill_value=0.)(img)
+          height_factor=(-0.167, 0.145), fill_mode='constant', fill_value=0.)(img)
+        #   # M87 diameter is 40 uas. We want ring diameters between 35 and 60 uas.
+        #   # img = tf.keras.layers.RandomZoom(
+        #   #   height_factor=(-0.5, 0.25), fill_mode='constant', fill_value=0.)(img)
+        #   # SgrA diameter is ~50 uas. We want ring diameters between 35 and 60 uas.
+        #   img = tf.keras.layers.RandomZoom(
+        #     height_factor=(-0.2, 0.3), fill_mode='constant', fill_value=0.)(img)
+        # else:
+        #   img = tf.keras.layers.RandomZoom(
+        #     height_factor=(-0.1, 0.1), fill_mode='constant', fill_value=0.)(img)
+      if config.data.constant_flux:
+        img *= config.data.total_flux / tf.reduce_sum(img)
       if uniform_dequantization:
         img = (tf.random.uniform(img.shape, dtype=tf.float32) + img * 255.) / 256.
       return dict(image=img, label=d.get('label', None))
@@ -283,6 +299,8 @@ def get_preprocess_fn(config: ml_collections.ConfigDict,
         img = tf.image.random_flip_left_right(img)
       if config.data.taper:
         img = tf.numpy_function(taper_fn, [img], tf.float32)
+      if config.data.constant_flux:
+        img *= config.data.total_flux / tf.reduce_sum(img)
       if uniform_dequantization:
         img = (tf.random.uniform(img.shape, dtype=tf.float32) + img * 255.) / 256.
       return dict(image=img, label=d.get('label', None))
@@ -341,7 +359,7 @@ def get_dataset(
     ]
 
   # Get dataset builder.
-  dataset_builder, resize_op = get_dataset_builder_and_resize_op(config)
+  dataset_builder, resize_op = get_dataset_builder_and_resize_op(config, shuffle_seed)
 
   # Get preprocessing function.
   preprocess_fn = get_preprocess_fn(
@@ -424,9 +442,9 @@ def get_dataset(
     test_ds = create_dataset(dataset_builder, 'test')  # 10
     val_ds = create_dataset(dataset_builder, 'val')  # 10
   elif config.data.dataset == 'GRMHD':
-    train_ds = create_dataset(dataset_builder, 'train')  # 2,884
-    test_ds = create_dataset(dataset_builder, 'test')  # 10
-    val_ds = create_dataset(dataset_builder, 'val')  # 10
+    train_ds = create_dataset(dataset_builder, 'train')  # 100,000
+    test_ds = create_dataset(dataset_builder, 'test')  # 100
+    val_ds = create_dataset(dataset_builder, 'val')  # 100
   elif config.data.dataset == 'Pynoisy':
     train_ds = create_dataset(dataset_builder, 'train')  # 12,000
     test_ds = create_dataset(dataset_builder, 'test')  # 100
