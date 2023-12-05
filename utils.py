@@ -322,3 +322,30 @@ def get_value_div_fn(fn):
     return value, jnp.sum(grad_fn_eps * eps, axis=tuple(range(1, len(x.shape))))
 
   return value_div_fn
+
+def plot_tight_image(image, **kwargs):
+  """Plot an image without any padding."""
+  fig = plt.figure(frameon=False)
+  fig.set_size_inches(image.shape[0], image.shape[1])
+  ax = plt.Axes(fig, [0., 0., 1., 1.])
+  ax.set_axis_off()
+  fig.add_axes(ax)
+  ax.imshow(image, aspect='auto', **kwargs)
+  return fig, ax
+
+
+def normalize_batch(arr):
+  axes = np.arange(1, len(arr.shape))
+  vmin = np.min(arr, axis=tuple(axes))
+  vmax = np.max(arr, axis=tuple(axes))
+  vmax = np.expand_dims(vmax - vmin, tuple(axes))
+  vmin = np.expand_dims(vmin, tuple(axes))
+  return (arr - vmin) / vmax
+
+
+def normalize_array(imarr, vmin=None, vmax=None):
+  if vmin is None:
+    vmin = imarr.min()
+  if vmax is None:
+    vmax = imarr.max()
+  return (imarr - vmin) / (vmax - vmin)
