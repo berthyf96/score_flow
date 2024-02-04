@@ -128,6 +128,40 @@ def get_sampling_fn(config, sde, model, shape, inverse_scaler, eps):
   return sampling_fn
 
 
+def get_sampling_fn_without_pmap(config, sde, model, shape, inverse_scaler, eps):
+  """Create a sampling function that's not pmapped."""
+
+  sampler_name = config.sampling.method
+  # Probability flow ODE sampling with black-box ODE solvers
+  if sampler_name.lower() == 'ode':
+    sampling_fn = get_ode_sampler_without_pmap(sde=sde,
+                                  model=model,
+                                  shape=shape,
+                                  inverse_scaler=inverse_scaler,
+                                  denoise=config.sampling.noise_removal,
+                                  eps=eps)
+  # Predictor-Corrector sampling. Predictor-only and Corrector-only samplers are special cases.
+  elif sampler_name.lower() == 'pc':
+    predictor = get_predictor(config.sampling.predictor.lower())
+    corrector = get_corrector(config.sampling.corrector.lower())
+    sampling_fn = get_pc_sampler_without_pmap(sde=sde,
+                                 model=model,
+                                 shape=shape,
+                                 predictor=predictor,
+                                 corrector=corrector,
+                                 inverse_scaler=inverse_scaler,
+                                 snr=config.sampling.snr,
+                                 n_steps=config.sampling.n_steps_each,
+                                 probability_flow=config.sampling.probability_flow,
+                                 continuous=config.training.continuous,
+                                 denoise=config.sampling.noise_removal,
+                                 eps=eps)
+  else:
+    raise ValueError(f"Sampler name {sampler_name} unknown.")
+
+  return sampling_fn
+
+
 class Predictor(abc.ABC):
   """The abstract class for a predictor algorithm."""
 
@@ -479,6 +513,116 @@ def get_ode_sampler(sde, model, shape, inverse_scaler,
     return x
 
   @jax.pmap
+  def drift_fn(state, x, t):
+    """Get the drift function of the reverse-time SDE."""
+    score_fn = get_score_fn(sde, model, state.params_ema, state.model_state, train=False, continuous=True)
+    rsde = sde.reverse(score_fn, probability_flow=True)
+    return rsde.sde(x, t)[0]
+
+  def ode_sampler(prng, pstate, z=None):
+    """The probability flow ODE sampler with black-box ODE solver.
+
+    Args:
+      prng: An array of random state. The leading dimension equals the number of devices.
+      pstate: Replicated training state for running on multiple devices.
+      z: If present, generate samples from latent code `z`.
+    Returns:
+      Samples, and the number of function evaluations.
+    """
+    # Initial sample
+    rng = flax.jax_utils.unreplicate(prng)
+    rng, step_rng = random.split(rng)
+    if z is None:
+      # If not represent, sample the latent code from the prior distibution of the SDE.
+      x = sde.prior_sampling(step_rng, (jax.local_device_count(),) + shape)
+    else:
+      x = z
+
+    def ode_func(t, x):
+      x = from_flattened_numpy(x, (jax.local_device_count(),) + shape)
+      vec_t = jnp.ones((x.shape[0], x.shape[1])) * t
+      drift = drift_fn(pstate, x, vec_t)
+      return to_flattened_numpy(drift)
+
+    # Black-box ODE solver for the probability flow ODE
+    solution = integrate.solve_ivp(ode_func, (sde.T, eps), to_flattened_numpy(x),
+                                   rtol=rtol, atol=atol, method=method)
+    nfe = solution.nfev
+    x = jnp.asarray(solution.y[:, -1]).reshape((jax.local_device_count(),) + shape)
+
+    # Denoising is equivalent to running one predictor step without adding noise
+    if denoise:
+      rng, *step_rng = random.split(rng, jax.local_device_count() + 1)
+      step_rng = jnp.asarray(step_rng)
+      x = denoise_update_fn(step_rng, pstate, x)
+
+    x = inverse_scaler(x)
+    return x, nfe
+
+  return ode_sampler
+
+
+def get_pc_sampler_without_pmap(sde, model, shape, predictor, corrector, inverse_scaler, snr,
+                   n_steps=1, probability_flow=False, continuous=False,
+                   denoise=True, eps=1e-3):
+  """Create a Predictor-Corrector (PC) sampler that's not pmapped."""
+  predictor_update_fn = functools.partial(shared_predictor_update_fn,
+                                          sde=sde,
+                                          model=model,
+                                          predictor=predictor,
+                                          probability_flow=probability_flow,
+                                          continuous=continuous)
+  corrector_update_fn = functools.partial(shared_corrector_update_fn,
+                                          sde=sde,
+                                          model=model,
+                                          corrector=corrector,
+                                          continuous=continuous,
+                                          snr=snr,
+                                          n_steps=n_steps)
+
+  def pc_sampler(rng, state):
+    """ The PC sampler funciton.
+
+    Args:
+      rng: A JAX random state
+      state: A `flax.struct.dataclass` object that represents the training state of a score-based model.
+    Returns:
+      Samples, number of function evaluations
+    """
+    # Initial sample
+    rng, step_rng = random.split(rng)
+    x = sde.prior_sampling(step_rng, shape)
+    timesteps = jnp.linspace(sde.T, eps, sde.N)
+
+    def loop_body(i, val):
+      rng, x, x_mean = val
+      t = timesteps[i]
+      vec_t = jnp.ones(shape[0]) * t
+      rng, step_rng = random.split(rng)
+      x, x_mean = corrector_update_fn(step_rng, state, x, vec_t)
+      rng, step_rng = random.split(rng)
+      x, x_mean = predictor_update_fn(step_rng, state, x, vec_t)
+      return rng, x, x_mean
+
+    _, x, x_mean = jax.lax.fori_loop(0, sde.N, loop_body, (rng, x, x))
+    # Denoising is equivalent to running one predictor step without adding noise.
+    return inverse_scaler(x_mean if denoise else x), sde.N * (n_steps + 1)
+
+  return jax.jit(pc_sampler)
+
+
+def get_ode_sampler_without_pmap(sde, model, shape, inverse_scaler,
+                    denoise=False, rtol=1e-5, atol=1e-5, method='RK45', eps=1e-3):
+  """Probability flow ODE sampler with the black-box ODE solver."""
+
+  def denoise_update_fn(rng, state, x):
+    score_fn = get_score_fn(sde, model, state.params_ema, state.model_state, train=False, continuous=True)
+    # Reverse diffusion predictor for denoising
+    predictor_obj = ReverseDiffusionPredictor(sde, score_fn, probability_flow=False)
+    vec_eps = jnp.ones((x.shape[0],)) * eps
+    _, x = predictor_obj.update_fn(rng, x, vec_eps)
+    return x
+
   def drift_fn(state, x, t):
     """Get the drift function of the reverse-time SDE."""
     score_fn = get_score_fn(sde, model, state.params_ema, state.model_state, train=False, continuous=True)

@@ -26,7 +26,7 @@ import tensorflow as tf
 import tensorflow_datasets as tfds
 
 SUPPORTED_DATASETS = ['CIFAR10', 'CELEBA', 'fastMRI', 'SVHN', 'LSUN', 'CelebAHQ', 'SgrA', 'GRMHD', 'Pynoisy',
-                      'Pinknoise', 'PinknoiseFull', 'falpha', 'f2', 'f1', 'f1.5', 'f12', 'Matern']
+                      'Matern', 'Dispersion', 'Burgers']
 
 
 def get_data_scaler(config):
@@ -188,28 +188,25 @@ def get_dataset_builder_and_resize_op(config: ml_collections.ConfigDict, shuffle
       return tf.image.resize(
           img, [config.data.image_size, config.data.image_size],
           antialias=config.data.antialias)
-  elif config.data.dataset in ['SgrA', 'GRMHD', 'PinknoiseFull', 'Pinknoise', 'Pynoisy', 'Matern', 'f1', 'f2', 'f1.5', 'f12', 'falpha']:
+  elif config.data.dataset in ['SgrA', 'GRMHD', 'PinknoiseFull', 'Pinknoise', 'Pynoisy', 'Matern', 'Dispersion', 'Burgers']:
     if config.data.dataset == 'SgrA':
       image_dim = 100 * 100
       dataset_name = 'sgra'
     elif config.data.dataset == 'GRMHD':
       image_dim = 400 * 400
       dataset_name = 'grmhd'
-    elif config.data.dataset == 'Pinknoise':
-      image_dim = 32 * 32
-      dataset_name = 'pinknoise'
-    elif config.data.dataset == 'PinknoiseFull':
-      image_dim = 32 * 32
-      dataset_name = 'pinknoise'
-    elif config.data.dataset in ['falpha', 'f1', 'f2', 'f1.5', 'f12']:
-      image_dim = 32 * 32
-      dataset_name = config.data.dataset
     elif config.data.dataset == 'Pynoisy':
       image_dim = 160 * 160
       dataset_name = 'pynoisy'
     elif config.data.dataset == 'Matern':
       image_dim = 32 * 32
       dataset_name = f'matern{config.data.matern_scale}'
+    elif config.data.dataset == 'Dispersion':
+      image_dim = config.data.image_size * config.data.image_size
+      dataset_name = f'dispersion{config.data.image_size}'
+    elif config.data.dataset == 'Burgers':
+      image_dim = config.data.image_size * config.data.image_size
+      dataset_name = 'burgers'
     features_dict = {
       'image': tf.io.FixedLenFeature([image_dim], tf.float32),
       'shape': tf.io.FixedLenFeature([2], tf.int64)
@@ -242,17 +239,30 @@ def get_dataset_builder_and_resize_op(config: ml_collections.ConfigDict, shuffle
           os.path.join(config.data.tfds_dir,
                        f'matern/{dataset_name}/{dataset_name}-test.tfrecord-*')),
       }
-    elif config.data.dataset == 'PinknoiseFull':
+    elif config.data.dataset == 'Dispersion':
       dataset_builder = {
         'train': ds_from_tfrecords(
           os.path.join(config.data.tfds_dir,
-                       f'pinknoise_full/pinknoise-train.tfrecord-*')),
+                       f'dispersion/{dataset_name}/{dataset_name}-train.tfrecord-*')),
         'val': ds_from_tfrecords(
           os.path.join(config.data.tfds_dir,
-                       f'pinknoise_full/pinknoise-val.tfrecord-*')),
+                       f'dispersion/{dataset_name}/{dataset_name}-val.tfrecord-*')),
         'test': ds_from_tfrecords(
           os.path.join(config.data.tfds_dir,
-                       f'pinknoise_full/pinknoise-test.tfrecord-*')),
+                       f'dispersion/{dataset_name}/{dataset_name}-test.tfrecord-*')),
+      }
+    elif config.data.dataset == 'Burgers':
+      image_size = config.data.image_size
+      dataset_builder = {
+        'train': ds_from_tfrecords(
+          os.path.join(config.data.tfds_dir,
+                       f'burgers/burgers{image_size}x{image_size}/{dataset_name}-train.tfrecord-*')),
+        'val': ds_from_tfrecords(
+          os.path.join(config.data.tfds_dir,
+                       f'burgers/burgers{image_size}x{image_size}/{dataset_name}-val.tfrecord-*')),
+        'test': ds_from_tfrecords(
+          os.path.join(config.data.tfds_dir,
+                       f'burgers/burgers{image_size}x{image_size}/{dataset_name}-test.tfrecord-*')),
       }
     else:
       dataset_builder = {
@@ -288,7 +298,7 @@ def get_preprocess_fn(config: ml_collections.ConfigDict,
 
   # Get function for tapering images with a centered Gaussian blob.
   taper_fn = get_taper_fn(config)
-  warp_fn = get_warp_fn(config)
+  # warp_fn = get_warp_fn(config)
 
   if config.data.dataset == 'CelebAHQ':
     @tf.autograph.experimental.do_not_convert
@@ -440,7 +450,7 @@ def get_dataset(
       ds = dataset_builder.as_dataset(
           split=source_split, shuffle_files=True, read_config=read_config)
     elif config.data.dataset in [
-        'Eigenfaces', 'fastMRI', 'CelebAHQ', 'SgrA', 'GRMHD', 'Pynoisy', 'Pinknoise', 'PinknoiseFull', 'falpha', 'f1', 'f2', 'f1.5', 'f12', 'Matern'
+        'Eigenfaces', 'fastMRI', 'CelebAHQ', 'SgrA', 'GRMHD', 'Pynoisy', 'Matern', 'Dispersion', 'Burgers'
     ]:
       ds = dataset_builder[source_split].with_options(dataset_options)
     else:
@@ -499,34 +509,6 @@ def get_dataset(
     train_ds = create_dataset(dataset_builder, 'train')  # 100,000
     test_ds = create_dataset(dataset_builder, 'test')  # 100
     val_ds = create_dataset(dataset_builder, 'val')  # 100
-  elif config.data.dataset == 'Pinknoise':
-    train_ds = create_dataset(dataset_builder, 'train')  # 45,000
-    test_ds = create_dataset(dataset_builder, 'test')  # 10,000
-    val_ds = create_dataset(dataset_builder, 'val')  # 5,000
-  elif config.data.dataset == 'PinknoiseFull':
-    train_ds = create_dataset(dataset_builder, 'train')  # 100,000
-    test_ds = create_dataset(dataset_builder, 'test')  # 10,000
-    val_ds = create_dataset(dataset_builder, 'val')  # 5,000
-  elif config.data.dataset == 'f1':
-    train_ds = create_dataset(dataset_builder, 'train')  # 45,000
-    test_ds = create_dataset(dataset_builder, 'test')  # 10,000
-    val_ds = create_dataset(dataset_builder, 'val')  # 5,000
-  elif config.data.dataset == 'f2':
-    train_ds = create_dataset(dataset_builder, 'train')  # 45,000
-    test_ds = create_dataset(dataset_builder, 'test')  # 10,000
-    val_ds = create_dataset(dataset_builder, 'val')  # 5,000
-  elif config.data.dataset == 'falpha':
-    train_ds = create_dataset(dataset_builder, 'train')  # 45,000
-    test_ds = create_dataset(dataset_builder, 'test')  # 10,000
-    val_ds = create_dataset(dataset_builder, 'val')  # 5,000
-  elif config.data.dataset == 'f12':
-    train_ds = create_dataset(dataset_builder, 'train')  # 45,000
-    test_ds = create_dataset(dataset_builder, 'test')  # 10,000
-    val_ds = create_dataset(dataset_builder, 'val')  # 5,000
-  elif config.data.dataset == 'f1.5':
-    train_ds = create_dataset(dataset_builder, 'train')  # 45,000
-    test_ds = create_dataset(dataset_builder, 'test')  # 10,000
-    val_ds = create_dataset(dataset_builder, 'val')  # 5,000
   elif config.data.dataset == 'Matern':
     train_ds = create_dataset(dataset_builder, 'train')  # 45,000
     test_ds = create_dataset(dataset_builder, 'test')  # 10,000
@@ -535,6 +517,14 @@ def get_dataset(
     train_ds = create_dataset(dataset_builder, 'train')  # 12,000
     test_ds = create_dataset(dataset_builder, 'test')  # 100
     val_ds = create_dataset(dataset_builder, 'val')  # 100
+  elif config.data.dataset == 'Dispersion':
+    train_ds = create_dataset(dataset_builder, 'train')  # 14,800
+    test_ds = create_dataset(dataset_builder, 'test')  # 10
+    val_ds = create_dataset(dataset_builder, 'val')  # 10
+  elif config.data.dataset == 'Burgers':
+    train_ds = create_dataset(dataset_builder, 'train')  # 10,000
+    test_ds = create_dataset(dataset_builder, 'test')  # 1,000
+    val_ds = create_dataset(dataset_builder, 'val')  # 1,000
   return train_ds, val_ds, test_ds
 
 
