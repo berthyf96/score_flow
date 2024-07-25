@@ -25,8 +25,7 @@ from scipy.ndimage import gaussian_filter
 import tensorflow as tf
 import tensorflow_datasets as tfds
 
-SUPPORTED_DATASETS = ['CIFAR10', 'CELEBA', 'fastMRI', 'SVHN', 'LSUN', 'CelebAHQ', 'SgrA', 'GRMHD', 'Pynoisy',
-                      'Matern', 'Dispersion', 'Burgers']
+SUPPORTED_DATASETS = ['CIFAR10', 'CELEBA', 'fastMRI', 'SVHN', 'LSUN', 'CelebAHQ', 'SgrA', 'GRMHD', 'GRMHD1', 'GRMHD2', 'Pynoisy', 'Matern', 'Dispersion', 'Burgers']
 
 
 def get_data_scaler(config):
@@ -188,11 +187,11 @@ def get_dataset_builder_and_resize_op(config: ml_collections.ConfigDict, shuffle
       return tf.image.resize(
           img, [config.data.image_size, config.data.image_size],
           antialias=config.data.antialias)
-  elif config.data.dataset in ['SgrA', 'GRMHD', 'PinknoiseFull', 'Pinknoise', 'Pynoisy', 'Matern', 'Dispersion', 'Burgers']:
+  elif config.data.dataset in ['SgrA', 'GRMHD', 'GRMHD1', 'GRMHD2', 'PinknoiseFull', 'Pinknoise', 'Pynoisy', 'Matern', 'Dispersion', 'Burgers']:
     if config.data.dataset == 'SgrA':
       image_dim = 100 * 100
       dataset_name = 'sgra'
-    elif config.data.dataset == 'GRMHD':
+    elif config.data.dataset in ['GRMHD', 'GRMHD1', 'GRMHD2']:
       image_dim = 400 * 400
       dataset_name = 'grmhd'
     elif config.data.dataset == 'Pynoisy':
@@ -264,6 +263,32 @@ def get_dataset_builder_and_resize_op(config: ml_collections.ConfigDict, shuffle
           os.path.join(config.data.tfds_dir,
                        f'burgers/burgers{image_size}x{image_size}/{dataset_name}-test.tfrecord-*')),
       }
+    elif config.data.dataset == 'GRMHD1':
+      image_size = config.data.image_size
+      dataset_builder = {
+        'train': ds_from_tfrecords(
+          os.path.join(config.data.tfds_dir,
+                       f'{dataset_name}/{dataset_name}-train.tfrecord-000*')),
+        'val': ds_from_tfrecords(
+          os.path.join(config.data.tfds_dir,
+                       f'{dataset_name}/{dataset_name}-val.tfrecord-*')),
+        'test': ds_from_tfrecords(
+          os.path.join(config.data.tfds_dir,
+                       f'{dataset_name}/{dataset_name}-test.tfrecord-*')),
+      }
+    elif config.data.dataset == 'GRMHD2':
+      image_size = config.data.image_size
+      dataset_builder = {
+        'train': ds_from_tfrecords(
+          os.path.join(config.data.tfds_dir,
+                       f'{dataset_name}/{dataset_name}-train.tfrecord-001*')),
+        'val': ds_from_tfrecords(
+          os.path.join(config.data.tfds_dir,
+                       f'{dataset_name}/{dataset_name}-val.tfrecord-*')),
+        'test': ds_from_tfrecords(
+          os.path.join(config.data.tfds_dir,
+                       f'{dataset_name}/{dataset_name}-test.tfrecord-*')),
+      }
     else:
       dataset_builder = {
         'train': ds_from_tfrecords(
@@ -315,7 +340,7 @@ def get_preprocess_fn(config: ml_collections.ConfigDict,
       if uniform_dequantization:
         img = (tf.random.uniform(img.shape, dtype=tf.float32) + img * 255.) / 256.
       return dict(image=img, label=None)
-  elif config.data.dataset == 'SgrA' or config.data.dataset == 'GRMHD':
+  elif config.data.dataset == 'SgrA' or config.data.dataset in ['GRMHD', 'GRMHD1', 'GRMHD2']:
     # These datasets' images can be randomly rotated and zoomed in/out.
     @tf.autograph.experimental.do_not_convert
     def preprocess_fn(d):
@@ -450,7 +475,7 @@ def get_dataset(
       ds = dataset_builder.as_dataset(
           split=source_split, shuffle_files=True, read_config=read_config)
     elif config.data.dataset in [
-        'Eigenfaces', 'fastMRI', 'CelebAHQ', 'SgrA', 'GRMHD', 'Pynoisy', 'Matern', 'Dispersion', 'Burgers'
+        'Eigenfaces', 'fastMRI', 'CelebAHQ', 'SgrA', 'GRMHD', 'GRMHD1', 'GRMHD2', 'Pynoisy', 'Matern', 'Dispersion', 'Burgers'
     ]:
       ds = dataset_builder[source_split].with_options(dataset_options)
     else:
@@ -507,6 +532,10 @@ def get_dataset(
     val_ds = create_dataset(dataset_builder, 'val')  # 10
   elif config.data.dataset == 'GRMHD':
     train_ds = create_dataset(dataset_builder, 'train')  # 100,000
+    test_ds = create_dataset(dataset_builder, 'test')  # 100
+    val_ds = create_dataset(dataset_builder, 'val')  # 100
+  elif config.data.dataset in ['GRMHD1', 'GRMHD2']:
+    train_ds = create_dataset(dataset_builder, 'train')  # 50,000
     test_ds = create_dataset(dataset_builder, 'test')  # 100
     val_ds = create_dataset(dataset_builder, 'val')  # 100
   elif config.data.dataset == 'Matern':
